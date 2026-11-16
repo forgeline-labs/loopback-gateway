@@ -15,6 +15,30 @@ def _json_body(body: bytes) -> object:
     return json.loads(body.decode("utf-8"))
 
 
+def _read_socket_response(sock: socket.socket) -> tuple[int, dict[str, str], bytes]:
+    """Read exactly one Content-Length-delimited HTTP response from a socket."""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise AssertionError("connection closed before response headers")
+        data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    status = int(lines[0].split(b" ")[1])
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(b":")
+        headers[name.decode("ascii").strip().lower()] = value.decode("ascii").strip()
+    length = int(headers.get("content-length", "0"))
+    while len(body) < length:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        body += chunk
+    return status, headers, body[:length]
+
+
 class HttpTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = support.TempDir()
@@ -282,6 +306,71 @@ class HttpTest(unittest.TestCase):
                 status, _, body = support.http_request(port, "HEAD", path)
                 self.assertEqual(status, 405)
                 self.assertEqual(body, b"")
+        self.assertEqual(self.upstream.call_count(), 0)
+
+    def test_ac10_post_body_does_not_desync_keep_alive(self) -> None:
+        port = self.start(limit=5)
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+            sock.sendall(
+                b"POST /proxy HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Authorization: Bearer demo-token\r\n"
+                b"Content-Length: 11\r\n\r\n"
+                b"hello world"
+            )
+            status, _, body = _read_socket_response(sock)
+            self.assertEqual(status, 405)
+            self.assertEqual(_json_body(body), {"error": "method_not_allowed"})
+
+            sock.sendall(
+                b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            )
+            status, _, body = _read_socket_response(sock)
+            self.assertEqual(status, 200)
+            self.assertEqual(_json_body(body), {"status": "ok"})
+        self.assertEqual(self.upstream.call_count(), 0)
+
+    def test_ac10_get_with_body_does_not_desync_keep_alive(self) -> None:
+        port = self.start(limit=5)
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+            sock.sendall(
+                b"GET /proxy HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Length: 4\r\n\r\n"
+                b"body"
+            )
+            status, _, body = _read_socket_response(sock)
+            self.assertEqual(status, 401)
+            self.assertEqual(_json_body(body), {"error": "unauthorized"})
+
+            sock.sendall(
+                b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            )
+            status, _, body = _read_socket_response(sock)
+            self.assertEqual(status, 200)
+            self.assertEqual(_json_body(body), {"status": "ok"})
+        self.assertEqual(self.upstream.call_count(), 0)
+
+    def test_ac10_undrainable_body_closes_connection(self) -> None:
+        port = self.start(limit=5)
+        cases = {
+            "oversized": b"Content-Length: 65537\r\n",
+            "chunked": b"Transfer-Encoding: chunked\r\n",
+            "malformed": b"Content-Length: nope\r\n",
+        }
+        for name, framing in cases.items():
+            with self.subTest(case=name):
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                    sock.sendall(
+                        b"POST /proxy HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                        + framing
+                        + b"\r\n"
+                    )
+                    status, headers, body = _read_socket_response(sock)
+                    self.assertEqual(status, 405)
+                    self.assertEqual(_json_body(body), {"error": "method_not_allowed"})
+                    self.assertEqual(headers.get("connection", "").lower(), "close")
+                    self.assertEqual(sock.recv(4096), b"")
         self.assertEqual(self.upstream.call_count(), 0)
 
     # -- AC-12 -------------------------------------------------------------

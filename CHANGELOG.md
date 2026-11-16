@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Keep-alive connections no longer desynchronize when a request carries a body:
+  bodies are now discarded before the response, and requests whose framing
+  cannot be drained safely (`Transfer-Encoding`, duplicate, malformed or
+  oversized `Content-Length`) get `Connection: close`.
+
 ## [0.1.0] - 2026-11-13
 
 Initial release implementing spec 0.1.4.

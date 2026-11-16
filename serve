@@ -22,6 +22,7 @@ PRODUCT_NAME = "loopback-gateway"
 PRODUCT_VERSION = "0.1.0"
 
 MAX_UPSTREAM_BODY = 65536
+MAX_DISCARD_BODY = 65536
 UPSTREAM_TIMEOUT_SECONDS = 1.0
 MAX_CLOCK_MS = (1 << 53) - 1
 
@@ -288,6 +289,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method: str) -> None:
         gateway: Gateway = self.server.gateway  # type: ignore[attr-defined]
+        # The gateway never uses request bodies.  Consume any body before
+        # responding so its bytes cannot be parsed as the next request on a
+        # keep-alive connection.
+        if not self._drain_request_body():
+            self.close_connection = True
         try:
             split = urlsplit(self.path)
             path = split.path
@@ -364,6 +370,39 @@ class GatewayHandler(BaseHTTPRequestHandler):
         else:
             self._send_upstream(status, content_type, body)
 
+    def _drain_request_body(self) -> bool:
+        """Discard the request body, returning False if keep-alive is unsafe.
+
+        Request bodies are never read by the gateway.  If one is left in the
+        socket, an HTTP/1.1 keep-alive connection would parse those bytes as
+        the start of the next request.  Small, self-delimited bodies are read
+        and discarded; chunked, malformed or oversized framings force the
+        connection closed after the response instead.
+        """
+        if self.headers.get("Transfer-Encoding") is not None:
+            return False
+        lengths = self.headers.get_all("Content-Length")
+        if not lengths:
+            return True
+        if len(lengths) != 1:
+            return False
+        raw = lengths[0].strip()
+        if DIGITS_RE.fullmatch(raw) is None:
+            return False
+        try:
+            length = int(raw)
+        except ValueError:
+            return False
+        if length > MAX_DISCARD_BODY:
+            return False
+        if length == 0:
+            return True
+        try:
+            drained = self.rfile.read(length)
+        except OSError:
+            return False
+        return len(drained) == length
+
     def _send_json(
         self, status: int, payload: dict[str, object], *, head: bool = False
     ) -> None:
@@ -371,6 +410,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            if self.close_connection:
+                self.send_header("Connection", "close")
             if head:
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -385,6 +426,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         try:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
+            if self.close_connection:
+                self.send_header("Connection", "close")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
