@@ -1,0 +1,2 @@
+# Development-only tooling. Pinned; never installed by the tests themselves.
+ruff==0.15.22
