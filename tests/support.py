@@ -179,7 +179,11 @@ class GatewayProcess:
         self.startup_line = b""
         self._closed = False
         if expect_ready:
-            self.port = self._read_startup_port()
+            try:
+                self.port = self._read_startup_port()
+            except Exception:
+                self.stop()
+                raise
 
     def _read_startup_port(self) -> int:
         stdout = self.process.stdout

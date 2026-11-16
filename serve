@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import codecs
 import http.client
+import io
 import json
 import re
+import socketserver
 import sys
 import threading
 import time
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -24,6 +27,7 @@ PRODUCT_VERSION = "0.1.0"
 MAX_UPSTREAM_BODY = 65536
 MAX_DISCARD_BODY = 65536
 UPSTREAM_TIMEOUT_SECONDS = 1.0
+CLIENT_BODY_TIMEOUT_SECONDS = 1.0
 MAX_CLOCK_MS = (1 << 53) - 1
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{8,64}\Z")
@@ -84,7 +88,7 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError(f"duplicate key: {key}")
+            raise ValueError("duplicate key")
         result[key] = value
     return result
 
@@ -145,10 +149,10 @@ def _is_int(value: object) -> bool:
 def parse_port(raw: str) -> int:
     if DIGITS_RE.fullmatch(raw) is None:
         raise CliError("--port must contain ASCII digits only", 2)
-    value = int(raw)
-    if value > 65535:
+    digits = raw.lstrip("0") or "0"
+    if len(digits) > 5 or (len(digits) == 5 and digits > "65535"):
         raise CliError("--port must be in 0..65535", 2)
-    return value
+    return int(digits)
 
 
 def parse_arguments(argv: list[str]) -> dict[str, object]:
@@ -262,6 +266,38 @@ def _json_bytes(payload: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+class DeadlineReader(io.RawIOBase):
+    """Apply the same deadline before every socket read, even inside readline."""
+
+    def __init__(self, raw, sock, deadline):
+        self.raw = raw
+        self.sock = sock
+        self.deadline = deadline
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("upstream deadline exceeded")
+        self.sock.settimeout(remaining)
+        return self.raw.readinto(buffer)
+
+    def close(self):
+        try:
+            self.raw.close()
+        finally:
+            super().close()
+
+
+class DeadlineResponse(http.client.HTTPResponse):
+    def __init__(self, sock, *, deadline, **kwargs):
+        super().__init__(sock, **kwargs)
+        # Keep SocketIO's ownership of the socket when HTTPConnection detaches it.
+        self.fp = io.BufferedReader(DeadlineReader(self.fp.detach(), sock, deadline))
+
+
 class GatewayHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = f"{PRODUCT_NAME}/{PRODUCT_VERSION}"
@@ -330,36 +366,45 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _forward(self, query: str) -> None:
         gateway: Gateway = self.server.gateway  # type: ignore[attr-defined]
         target = "/" + ("?" + query if query else "")
+        deadline = time.monotonic() + UPSTREAM_TIMEOUT_SECONDS
         connection = http.client.HTTPConnection(
             "127.0.0.1", gateway.upstream_port, timeout=UPSTREAM_TIMEOUT_SECONDS
         )
+        connection.response_class = partial(DeadlineResponse, deadline=deadline)
         error_code: str | None = None
         status = 502
         content_type = "application/octet-stream"
         body = b""
         try:
+            connection.connect()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("upstream deadline exceeded")
+            connection.sock.settimeout(remaining)
             connection.request("GET", target)
-            response = connection.getresponse()
-            status = response.status
-            if not 200 <= status <= 599:
-                error_code = "upstream_error"
-            else:
-                content_type = (
-                    response.getheader("Content-Type") or "application/octet-stream"
-                )
-                declared = response.getheader("Content-Length")
-                too_large = False
-                if declared is not None:
-                    try:
-                        too_large = int(declared) > MAX_UPSTREAM_BODY
-                    except ValueError:
-                        too_large = False
-                if too_large:
-                    error_code = "upstream_too_large"
+            with connection.getresponse() as response:
+                status = response.status
+                if not 200 <= status <= 599:
+                    error_code = "upstream_error"
                 else:
-                    body = response.read(MAX_UPSTREAM_BODY + 1)
-                    if len(body) > MAX_UPSTREAM_BODY:
+                    content_type = (
+                        response.getheader("Content-Type") or "application/octet-stream"
+                    )
+                    # HTTPResponse accounts for statuses with no body (204/304)
+                    # and for chunked framing before exposing the remaining length.
+                    if (
+                        response.length is not None
+                        and response.length > MAX_UPSTREAM_BODY
+                    ):
                         error_code = "upstream_too_large"
+                    else:
+                        body = response.read(MAX_UPSTREAM_BODY + 1)
+                        if len(body) > MAX_UPSTREAM_BODY:
+                            error_code = "upstream_too_large"
+                        elif response.length not in (None, 0):
+                            error_code = "upstream_error"
+                if time.monotonic() >= deadline:
+                    error_code = "upstream_error"
         except (OSError, http.client.HTTPException, ValueError):
             error_code = "upstream_error"
         finally:
@@ -397,11 +442,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return False
         if length == 0:
             return True
+        deadline = time.monotonic() + CLIENT_BODY_TIMEOUT_SECONDS
+        previous_timeout = self.connection.gettimeout()
         try:
-            drained = self.rfile.read(length)
+            remaining_body = length
+            while remaining_body:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.connection.settimeout(remaining)
+                chunk = self.rfile.read1(remaining_body)
+                if not chunk:
+                    return False
+                remaining_body -= len(chunk)
+            return time.monotonic() < deadline
         except OSError:
             return False
-        return len(drained) == length
+        finally:
+            self.connection.settimeout(previous_timeout)
 
     def _send_json(
         self, status: int, payload: dict[str, object], *, head: bool = False
@@ -438,6 +496,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
 class GatewayServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind does a blocking reverse DNS lookup.  This
+        # loopback-only service already knows its host; DNS is not readiness.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def __init__(self, address: tuple[str, int], gateway: Gateway) -> None:
         self.gateway = gateway
