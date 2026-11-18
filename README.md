@@ -46,7 +46,7 @@ flowchart LR
 - Native Windows is out of scope for this version.
 - Runtime standard library only; there is nothing to install to run the gateway.
 
-## Quickstart
+## Usage examples
 
 Requires Python 3.12, curl and a POSIX shell. Run all steps from the repository
 root in the same shell, with ports **9000 and 8080 free**. New checked-in
