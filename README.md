@@ -48,52 +48,26 @@ flowchart LR
 
 ## Quickstart
 
-The gateway needs a config file and a port. The upstream may be any local HTTP
-server; a static file server is enough for a demo.
+Requires Python 3.12, curl and a POSIX shell. Run all steps from the repository
+root in the same shell, with ports **9000 and 8080 free**. New checked-in
+fixtures are `fixtures/config.json` and `fixtures/www/index.html`.
+`demo-token` is a public demo value, never a production credential.
+Startup waits for the upstream, then for the gateway health endpoint; logs
+go to `upstream.log` and `gateway.log`. The unauthenticated request is
+HTTP 401; curl `-f` suppresses the response body and exits 22. The final
+step stops and reaps both servers (wait returns 143 after SIGTERM).
 
-```bash
-# Shell 1: a stand-in upstream on loopback port 9000
-python -m http.server 9000 --bind 127.0.0.1
-
-# Shell 2: the gateway
-cat > config.json <<'JSON'
-{"upstream_port":9000,"token":"demo-token","limit":2,"window_ms":1000}
-JSON
-./serve --config config.json --port 8080
-```
-
-The gateway prints exactly one startup line and then becomes ready:
-
-```text
+```console
+$ python -m http.server 9000 --bind 127.0.0.1 --directory fixtures/www > upstream.log 2>&1 & upstream_pid=$!; until curl -fsS http://127.0.0.1:9000/ -o /dev/null 2>/dev/null; do sleep 0.1; done
+$ python serve --config fixtures/config.json --port 8080 > gateway.log 2>&1 & gateway_pid=$!; until curl -fsS http://127.0.0.1:8080/health -o /dev/null 2>/dev/null; do sleep 0.1; done; cat gateway.log
 {"port":8080}
-```
-
-Make requests from a third shell:
-
-```console
-$ curl -s http://127.0.0.1:8080/health
-{"status":"ok"}
-
-$ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/proxy
-401
-
-$ curl -s -o /dev/null -w '%{http_code}\n' \
-    -H 'Authorization: Bearer demo-token' http://127.0.0.1:8080/proxy
-200
-
-$ curl -s -o /dev/null -w '%{http_code}\n' \
-    -H 'Authorization: Bearer demo-token' http://127.0.0.1:8080/proxy
-200
-
-$ curl -s -H 'Authorization: Bearer demo-token' http://127.0.0.1:8080/proxy
-{"error":"rate_limited"}
-```
-
-`./serve` and `python serve` are equivalent on POSIX:
-
-```console
-$ python serve --version
-loopback-gateway 0.1.0
+$ curl -fsS -H 'Authorization: Bearer demo-token' http://127.0.0.1:8080/proxy
+hello
+$ curl -fsS http://127.0.0.1:8080/proxy
+curl: (22) The requested URL returned error: 401
+$ echo $?
+22
+$ kill "$gateway_pid" "$upstream_pid"; wait "$gateway_pid" "$upstream_pid" 2>/dev/null
 ```
 
 ## CLI
